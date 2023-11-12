@@ -19,7 +19,7 @@ public class Connection implements Runnable {
              ObjectInputStream in = new ObjectInputStream(clientSocket.getInputStream())) {
             String fileName = (String) in.readObject();
             int fileLength = in.readInt();
-            File file = new File("uploads\\" + fileName);
+            File file = new File("D:\\seti\\untitled1\\src\\main\\resources\\uploads" + fileName);
 
             int totalReadLength = 0;
             int partlyReadLength = 0;
