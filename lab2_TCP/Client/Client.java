@@ -4,6 +4,7 @@ import java.net.Socket;
 import java.net.UnknownHostException;
 import java.time.LocalTime;
 
+
 public class Client {
     public static void main(String[] args) {
         if (args.length != 2) {
@@ -26,15 +27,18 @@ public class Client {
             System.exit(1);
         }
 
+
         System.out.println("Connection to:" + address +":" + port);
         File file;
+
+
         try (ObjectInputStream ois = new ObjectInputStream(socket.getInputStream());  //сериализируемые потоки байтов
              ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream())) {  //для приема и отправки
-            file = new File(args[0]);
-            out.writeObject(file.getName());  //записывает имя файла в поток
+            file = new File("D:\\seti\\untitled1\\src\\main\\resources\\photo.jpg");
+           out.writeObject(file.getName());  //записывает имя файла в поток
             out.flush(); //удостовериться что отправилось
             int buffSize = 1024;
-            int totalReadLength = 0;
+             int totalReadLength = 0;
             byte[] buff = new byte[buffSize];
             int fileLen = (int)file.length();
             out.writeInt(fileLen); //отправляет длину файла
@@ -44,7 +48,7 @@ public class Client {
             int readBytesCount = 0;
 
             try (BufferedInputStream in = new BufferedInputStream(new FileInputStream(file))) {
-                while(remainLen > 0) {
+               while(remainLen > 0) {
                     if (remainLen < buffSize) {
                         buff = new byte[remainLen];
                     }
@@ -58,7 +62,7 @@ public class Client {
                 }
             }
 
-            System.out.println("+----------------| DONE |----------------+");
+           System.out.println("+----------------| DONE |----------------+");
             LocalTime waitTime = LocalTime.now();
             while(true) {
                 try {
