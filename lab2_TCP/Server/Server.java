@@ -1,4 +1,5 @@
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 
@@ -14,7 +15,9 @@ public class Server {
         int numCon = 0;
 
         try {
-            serverSocket = new ServerSocket(port);
+       //     InetAddress ipAddress = InetAddress.getByName("192.168.56.1");
+         //   serverSocket = new ServerSocket(port, 0, ipAddress);
+              serverSocket = new ServerSocket(port);
             System.out.println("Server started");
             while (true) {
                 Socket clientSocket = serverSocket.accept(); //ожидает подключение клиента
