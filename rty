@@ -1,0 +1,318 @@
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.*;
+import java.util.HashMap;
+import java.util.Iterator;
+
+import org.xbill.DNS.*;
+import org.xbill.DNS.Record;
+
+public class Socks5Proxy {
+
+
+            //для запроса
+    private static final byte SOCKS_VERSION = 0x05;
+    private static final byte IPv4 = 0x01;
+    private static final byte DOMAIN_NAME = 0x03;
+
+                //для ответа сервера
+    private static final byte REQUEST_GRANTED = 0x00;  //запрос предоставлен
+    private static final byte GENERAL_FAILURE = 0x01; //ошибка SOCKS-сервера
+    private static final byte COMMAND_NOT_SUPPORTED = 0x07; //команда не поддерживается / ошибка протокола
+
+    private static final byte[] NO_AUTHENTICATION = new byte[] {0x05, 0x00};
+
+    private static final byte ESTABLISH_STREAM_CONNECTION = 0x01; //установить потоковое соединение
+
+    private static final int DNSPORT = 53;
+
+
+    private final Selector selector;
+    private final InetSocketAddress localSocket;
+
+    DatagramChannel DNSChannel;
+    HashMap<Integer, SelectionKey> DNSMap = new HashMap<>();
+   // String[] DNSServer = ResolverConfig.getCurrentConfig().servers(); //getting address of recursive resolver
+    String DNSServer = "8.8.8.8";
+
+    public Socks5Proxy(int port)throws IOException { //создает экземпляр прокси-сервера Socks5, который слушает указанный порт
+        selector = Selector.open(); //механизм для мониторинга ввод/вывод
+        localSocket = new InetSocketAddress(port); //сетевой адрес для прослушки входящих соединений
+    }
+
+    public void start() throws IOException {
+        ServerSocketChannel serverSocketChannel = ServerSocketChannel.open(); //открытие канала для прослушивания входящ соединений
+        serverSocketChannel.bind(localSocket); //привязка каналла к сокету
+        serverSocketChannel.configureBlocking(false); //настраиваем канал на работу в неблок режиме
+        serverSocketChannel.register(selector, SelectionKey.OP_ACCEPT); //регестрируем в селекторе операцию для принтия соединений
+
+
+        //Настройка DatagramChannel для DNS:
+
+        DNSChannel = DatagramChannel.open(); //// Открываем DatagramChannel для DNS
+        DNSChannel.configureBlocking(false); // Настраиваем DNSChannel на работу в неблокирующем режиме
+        DNSChannel.connect(new InetSocketAddress(DNSServer, DNSPORT)); // Устанавливаем соединение DNSChannel с удаленным InetSocketAddress (DNS-сервер)
+        SelectionKey DNSKey = DNSChannel.register(selector, SelectionKey.OP_READ); // Регистрируем DNSChannel в селекторе для чтения данных с DNS-сервера
+
+        while (!Thread.interrupted()) {
+            int num = selector.select();
+                                    //ждем событий в селекторе
+            if (num == 0)
+                continue;
+
+            Iterator<SelectionKey> iterator = selector.selectedKeys().iterator(); //итератор по событиям
+            while (iterator.hasNext()) {
+                SelectionKey key = iterator.next();
+
+                try {           //обработка конкретных событий
+
+                    if (key.isValid() && key.isReadable() && key == DNSKey) {
+                        resolveDNS();       //разрешение днс
+                        continue;
+                    }
+
+                    if (key.isValid() && key.isAcceptable()) { //готов ли к принятию
+                        accept(key);    //прием соединений
+                        continue;
+                    }
+
+                    if (key.isValid() && key.isConnectable()) {
+                        connect(key);   //подключение
+                        continue;
+                    }
+
+                    if (key.isValid() && key.isReadable()) {
+                        read(key);  //чтение
+                    }
+
+                    if (key.isValid() && key.isWritable()) {
+                        write(key);     //запись
+                    }
+
+                } catch (IOException e) {
+                    System.err.println(e.getMessage());
+                    System.exit(1);
+                } finally {
+                    iterator.remove();
+                }
+            }
+        }
+    }
+
+    private void accept(SelectionKey key) { //обработка приёма нового соединения
+        try {
+            SocketChannel clientSocketChannel = ((ServerSocketChannel) key.channel()).accept();//извлекаем клиентский сокет
+            clientSocketChannel.configureBlocking(false);   //неблокирующий режим
+            System.out.println("accept connection from " + clientSocketChannel.getRemoteAddress());   //вывод инф-ии о новом соединении
+
+            clientSocketChannel.register(selector, SelectionKey.OP_READ); //регистрируем в селекторе и определяем за какой операцией следить
+        } catch (IOException e) {
+            System.err.println(e.getMessage());
+        }
+    }
+
+    private void connect(SelectionKey key) throws IOException { //установка соединения с удаленным сервером
+        SocketChannel socketChannel = (SocketChannel) key.channel();    //получаем канал сокета из ключа
+        Attachment attachment = (Attachment) key.attachment();      //и объект вложения
+        try {
+            socketChannel.finishConnect();  //завершение процесса установки соединения
+            attachment.getIn().put(createServerResponse(key, REQUEST_GRANTED)).flip(); //готовим ответ сервера и помещаем его в буффер
+            attachment.setOut(((Attachment) attachment.getPeer().attachment()).getIn()); //устанавливаем связь между каналами
+            ((Attachment) attachment.getPeer().attachment()).setOut(attachment.getIn());    //для обмена данных
+            attachment.getPeer().interestOps(SelectionKey.OP_WRITE | SelectionKey.OP_READ);
+        } catch (Exception e) {
+            System.out.println("connection refused");
+            close(key);
+        }
+    }
+
+    private void read(SelectionKey key) throws IOException { //чтение данных из SocketChannel
+
+        if (key.attachment() == null) {
+            key.attach(new Attachment());   //если нет вложения - создаём новый и присоединяем к ключу
+        }
+        Attachment attachment = (Attachment) key.attachment();
+        SocketChannel socketChannel = (SocketChannel) key.channel();
+        try {
+            int a = 0;
+            if ((a = socketChannel.read(attachment.getIn())) < 0) { //читаем данные из сокета в буффер
+                close(key);                                                 //если меньше 0, то закрываем ключ
+            } else if (a > 0){
+              //  if (attachment.getPeer() == null)   //если нет пира - аутентификация
+               //     authenticate(key);
+               // else {
+                //    if (!((Attachment) key.attachment()).getPeer().isValid())
+                  //      return;
+               //     attachment.getPeer().interestOps(attachment.getPeer().interestOps() | SelectionKey.OP_WRITE);
+                    key.interestOps(key.interestOps() ^ SelectionKey.OP_READ);
+                    attachment.getIn().flip();
+            //    }
+            }
+        } catch (IOException e) {
+            System.out.println("connection refused");
+            close(key);
+        }
+    }
+
+    private void write(SelectionKey key) throws IOException { // запись данных в SocketChannel
+        Attachment attachment = (Attachment) key.attachment();
+        SocketChannel socketChannel = (SocketChannel) key.channel();
+        try {
+            int a = 0;
+            if ((a = socketChannel.write(attachment.getOut())) == -1) { //записываем данные из выходного буффера в сокет ченэл
+                close(key);
+            }
+            else if (attachment.getOut().remaining() == 0) { //если в буффере не осталось данных для записи
+                attachment.getOut().clear(); //очищаем буффер
+                key.interestOps(SelectionKey.OP_READ);
+                if (a > 0 && attachment.getPeer() != null)
+                    attachment.getPeer().interestOps(attachment.getPeer().interestOps() | SelectionKey.OP_READ);
+            }
+        } catch (IOException e) {
+            System.out.println("connection refused");
+            close(key);
+        }
+    }
+
+    private void close(SelectionKey key) throws IOException {   //закрытие соединения
+        key.cancel();
+        key.channel().close();
+        if (!key.isValid())
+            return;
+        if (((Attachment) key.attachment()).getPeer() != null) {        //закрытие пиров, если они есть
+            SelectionKey peerKey = ((Attachment) key.attachment()).getPeer();
+            ((Attachment) key.attachment()).setPeer(null);
+            peerKey.cancel();
+            peerKey.channel().close();
+        }
+    }
+
+  /*  private void authenticate(SelectionKey key) { //метод аутентификации для сервера
+        Attachment attachment = (Attachment)key.attachment();
+        byte[] in = attachment.getIn().array();
+        if (!attachment.isHandshakeCommitted()) { //была ли аунтификация
+            if (in[0] != SOCKS_VERSION || in[1] == 0x00) { //no authentication methods supported
+                attachment.getOut().put(createServerResponse(key, COMMAND_NOT_SUPPORTED)).flip();
+                key.interestOps(SelectionKey.OP_WRITE);
+                return;
+            }
+            for (int i = 0; i < in[1]; ++i) {
+                if (in[i + 2] == 0) {
+                    attachment.getOut().put(NO_AUTHENTICATION).flip();
+                    attachment.getIn().clear();
+                    key.interestOps(SelectionKey.OP_WRITE);
+                    attachment.setHandshakeCommitted(true);
+                    return;
+                }
+            }
+        }
+
+        if (in[0] != SOCKS_VERSION || in[1] != ESTABLISH_STREAM_CONNECTION || attachment.getIn().position() < 9) {  //проверка входных данных для соединения
+            attachment.getOut().put(createServerResponse(key, COMMAND_NOT_SUPPORTED)).flip();
+            key.interestOps(SelectionKey.OP_WRITE);
+        } else { //Если данные корректны, извлекаются адрес и порт из сообщения
+            int port = ((0xFF & in[attachment.getIn().position()-2]) << 8)+(0xFF & in[attachment.getIn().position()-1]);
+            attachment.setPort(port);
+            if (in[3] == IPv4) { //Обработка IPv4-адреса
+                byte[] address = new byte[] {in[4], in[5], in[6], in[7]};
+                try {
+                    InetAddress addr = InetAddress.getByAddress(address);
+                    attachment.setAddress(addr);
+                    createPeer(key);
+                    System.out.println("redirected to " + addr.getHostName() + ":" + port);
+                } catch (Exception e) {
+                    key.interestOps(SelectionKey.OP_WRITE);
+                    return;
+                }
+            } else if (in[3] == DOMAIN_NAME) { //Обработка Доменного Имени
+                int nameLength = in[4];
+                char[] address = new char[nameLength];
+                for (int i = 0; i < nameLength; ++i)
+                    address[i] = (char)in[i + 5];
+
+                String domainName = String.valueOf(address) + ".";
+                try {
+                    Name name = Name.fromString(domainName);
+                    Record record = Record.newRecord(name, Type.A, DClass.IN);
+                    Message message = Message.newQuery(record);
+                    DNSChannel.write(ByteBuffer.wrap(message.toWire()));
+                    DNSMap.put(message.getHeader().getID(), key);
+                } catch (IOException e) {
+                    attachment.getOut().put(createServerResponse(key, GENERAL_FAILURE)).flip();
+                    key.interestOps(SelectionKey.OP_WRITE);
+                    return;
+                }
+            } else {
+                key.interestOps(SelectionKey.OP_WRITE);
+                return;
+            }
+            attachment.getIn().clear();
+        }
+    }
+*/
+    private byte[] createServerResponse(SelectionKey key, byte status) { //формирование ответа сервера - байтовый массив длины 10
+        byte[] response = new byte[10];
+        response[0] = SOCKS_VERSION;
+        response[1] = status;
+        response[3] = IPv4;
+        SocketChannel socketChannel = (SocketChannel) key.channel();
+
+        try {
+            String address = ((InetSocketAddress) socketChannel.getRemoteAddress()).getAddress().getHostAddress();
+            int port = ((InetSocketAddress) socketChannel.getRemoteAddress()).getPort();
+            String[] strs = address.split("\\.");
+            for (int i = 4; i < 8; ++i)
+                response[i] = (byte)(Integer.parseInt(strs[i-4]));
+            response[8] = (byte)(port >> 8); //big endian
+            response[9] = (byte)(port & 0xFF);
+        } catch (Exception e) {
+            System.out.println("could not get socket inetAddr");
+            response[1] = GENERAL_FAILURE;
+        }
+        return response;
+    }
+
+    private void createPeer(SelectionKey key) throws IOException { //создание пира на основе данных из вложения
+        try {
+            Attachment attachment = (Attachment) key.attachment(); //получение данных из вложения
+            SocketChannel peer = SocketChannel.open();
+            peer.configureBlocking(false);
+            peer.connect(new InetSocketAddress(attachment.getAddress(), attachment.getPort())); //пытаемся установить соединение с удаленным хостом
+            SelectionKey peerKey = peer.register(key.selector(), SelectionKey.OP_CONNECT); //регистрируем пира в селекторе с итерес операцией
+            if (!key.isValid())
+                return;
+            key.interestOps(0); //снятие интереса к чтению и записи
+            attachment.setPeer(peerKey);
+            Attachment peerAttachment = new Attachment();      //создание объекта вложения и приклепление к ключу
+            peerAttachment.setPeer(key);
+            peerKey.attach(peerAttachment);
+        } catch (IOException e) {
+            System.out.println("could not create peer");
+            close(key);
+        }
+    }
+
+    private void resolveDNS() throws IOException{ //разрешение днс запросов
+        ByteBuffer buf = ByteBuffer.allocate(1024);     //буффер
+        if (DNSChannel.read(buf) <= 0)
+            return;
+        Message message = new Message(buf.array());
+        Record[] records = message.getSectionArray(1); //извлечение записей днс из ответа
+        for (Record record : records) { //перебор записей днс
+            if (record instanceof ARecord) { //является ли запись типа ARecord (IPv4-адрес).
+                ARecord aRecord = (ARecord) record;
+                int id = message.getHeader().getID(); //ид днс запроса
+                SelectionKey key = DNSMap.get(id);
+                if (key == null)
+                    continue;
+                Attachment attachment = (Attachment) key.attachment();
+                attachment.setAddress(aRecord.getAddress());
+                System.out.println("dns resolved : " + aRecord.getAddress() + " " + attachment.getPort());
+                createPeer(key); //создаём пир на основе ключа
+                return;
+            }
+        }
+    }
+}
